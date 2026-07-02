@@ -80,16 +80,14 @@ class Scheduler:
         return load_size
 
     def _spill_request_from_hbm(self, req, evicted_kv_size):
-        self.memory.free(evicted_kv_size, Device.NPU)
-        if self.enable_sparse_attention and self.memory.is_avail(evicted_kv_size, Device.LPDDR):
-            self.memory.allocate(evicted_kv_size, Device.LPDDR)
-            self.memory.mark_request_blocks(req, Device.LPDDR)
-            req.evicted_device = Device.LPDDR
-            self.pending_lpddr_eviction_bytes += evicted_kv_size
-            block_bytes = self.memory._kv_block_bytes()
-            self.pending_lpddr_eviction_count += (evicted_kv_size + block_bytes - 1) // block_bytes
-            return Device.LPDDR
+        if self.enable_sparse_attention:
+            metrics = self.memory.spill_request_blocks_from_hbm(req)
+            req.evicted_device = Device.LPDDR if metrics["lpddr_bytes"] else Device.CPU
+            self.pending_lpddr_eviction_bytes += metrics["lpddr_bytes"]
+            self.pending_lpddr_eviction_count += metrics["eviction_count"]
+            return req.evicted_device
 
+        self.memory.free(evicted_kv_size, Device.NPU)
         self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
         self.memory.mark_request_blocks(req, Device.CPU)
         req.evicted_device = Device.CPU

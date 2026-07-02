@@ -115,6 +115,9 @@ class MemoryModel():
     def _kv_block_bytes(self):
         return self.get_kv(self.block_size)
 
+    def _npu_kv_used(self):
+        return max(0, self.npu_used - self.weight)
+
     def _touch_block(self, key):
         self._residency_clock += 1
         self._block_last_access[key] = self._residency_clock
@@ -154,11 +157,15 @@ class MemoryModel():
                 continue
             dev = self._kv_residency.get(key)
             if dev == Device.NPU:
-                self.free(block_bytes, Device.NPU)
+                if self._npu_kv_used() >= block_bytes:
+                    self.free(block_bytes, Device.NPU)
             elif dev == Device.LPDDR:
-                self.free(block_bytes, Device.LPDDR)
+                if self.lpddr_used >= block_bytes:
+                    self.free(block_bytes, Device.LPDDR)
             elif dev == Device.CPU:
-                self.free(block_bytes * self.num_npus, Device.CPU)
+                cpu_block_bytes = block_bytes * self.num_npus
+                if self.cpu_used >= cpu_block_bytes:
+                    self.free(cpu_block_bytes, Device.CPU)
             elif dev == Device.CXL:
                 self.free(block_bytes * self.num_npus, Device.CXL)
             self._kv_residency.pop(key, None)
@@ -172,7 +179,7 @@ class MemoryModel():
         return int(bytes_count / bw_bytes_per_ns + self.lpddr_access_latency_ns)
 
     def _select_hbm_victims(self, protected, required_bytes, policy):
-        hbm_kv_blocks = max(0, (self.npu_used - self.weight) // self._kv_block_bytes())
+        hbm_kv_blocks = max(0, self._npu_kv_used() // self._kv_block_bytes())
         protected_hbm_blocks = sum(
             1 for key in protected
             if self._kv_residency.get(key) == Device.NPU
@@ -198,11 +205,21 @@ class MemoryModel():
     def _move_block(self, key, src, dst):
         block_bytes = self._kv_block_bytes()
         if src == Device.NPU:
-            self.free(block_bytes, Device.NPU)
+            if self._npu_kv_used() >= block_bytes:
+                self.free(block_bytes, Device.NPU)
+            else:
+                src = Device.UNTRACKED
         elif src == Device.LPDDR:
-            self.free(block_bytes, Device.LPDDR)
+            if self.lpddr_used >= block_bytes:
+                self.free(block_bytes, Device.LPDDR)
+            else:
+                src = Device.UNTRACKED
         elif src == Device.CPU:
-            self.free(block_bytes * self.num_npus, Device.CPU)
+            cpu_block_bytes = block_bytes * self.num_npus
+            if self.cpu_used >= cpu_block_bytes:
+                self.free(cpu_block_bytes, Device.CPU)
+            else:
+                src = Device.UNTRACKED
         elif src == Device.CXL:
             self.free(block_bytes * self.num_npus, Device.CXL)
         elif src == Device.UNTRACKED:
@@ -219,6 +236,30 @@ class MemoryModel():
 
         self._kv_residency[key] = dst
         self._touch_block(key)
+
+    def spill_request_blocks_from_hbm(self, req):
+        """Spill only blocks that are currently accounted as HBM-resident."""
+        block_bytes = self._kv_block_bytes()
+        metrics = {
+            "lpddr_bytes": 0,
+            "cpu_bytes": 0,
+            "eviction_count": 0,
+        }
+        for key in list(self._iter_request_block_keys(req)):
+            dev = self._kv_residency.get(key, Device.UNTRACKED)
+            if dev != Device.NPU:
+                continue
+            if self._npu_kv_used() < block_bytes:
+                self._kv_residency[key] = Device.UNTRACKED
+                continue
+            if self.lpddr_mem and self.lpddr_used + block_bytes <= self.lpddr_mem:
+                self._move_block(key, Device.NPU, Device.LPDDR)
+                metrics["lpddr_bytes"] += block_bytes
+            else:
+                self._move_block(key, Device.NPU, Device.CPU)
+                metrics["cpu_bytes"] += block_bytes * self.num_npus
+            metrics["eviction_count"] += 1
+        return metrics
 
     def plan_sparse_attention(self, req, selected_block_ids, policy="lru_promote"):
         """Rebalance sparse-attention KV blocks across HBM and LPDDR.
@@ -246,7 +287,7 @@ class MemoryModel():
 
         known_keys = {key for key in request_keys if key in self._kv_residency}
         hbm_blocks = sum(1 for key in known_keys if self._kv_residency.get(key) == Device.NPU)
-        max_hbm_blocks = max(0, (self.npu_used - self.weight) // block_bytes)
+        max_hbm_blocks = max(0, self._npu_kv_used() // block_bytes)
         missing_hbm_slots = max(0, int(max_hbm_blocks - hbm_blocks))
         for key in sorted(request_keys):
             if key in self._kv_residency:
