@@ -23,9 +23,9 @@ class MemoryModel():
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.ep_size = ep_size
-        self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
-        self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
-        self.cxl_mem = cxl_mem * GB_TO_BYTE
+        self.npu_mem = int(npu_mem * GB_TO_BYTE) # GB -> Byte
+        self.cpu_mem = int(cpu_mem * GB_TO_BYTE) # GB -> Byte
+        self.cxl_mem = int(cxl_mem * GB_TO_BYTE)
         self.lpddr_mem = 0
         self.lpddr_used = 0
         self.lpddr_bw = 0
@@ -106,7 +106,7 @@ class MemoryModel():
 
     def configure_lpddr(self, lpddr_mem=0, lpddr_bw=0, hbm_lpddr_bw=0,
                         lpddr_access_latency_ns=0):
-        self.lpddr_mem = (lpddr_mem or 0) * GB_TO_BYTE
+        self.lpddr_mem = int((lpddr_mem or 0) * GB_TO_BYTE)
         self.lpddr_bw = lpddr_bw or 0
         self.hbm_lpddr_bw = hbm_lpddr_bw or lpddr_bw or 0
         self.lpddr_access_latency_ns = lpddr_access_latency_ns or 0
@@ -184,7 +184,7 @@ class MemoryModel():
             candidates.sort(key=lambda k: self._block_last_access.get(k, 0))
 
         block_bytes = self._kv_block_bytes()
-        needed_blocks = (required_bytes + block_bytes - 1) // block_bytes
+        needed_blocks = int((required_bytes + block_bytes - 1) // block_bytes)
         return candidates[:needed_blocks]
 
     def _move_block(self, key, src, dst):
