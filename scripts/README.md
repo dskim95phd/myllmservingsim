@@ -13,6 +13,7 @@ live with their module — only setup and build helpers are here.
 | `install-vllm.sh` | Bare-metal vLLM install via `uv venv` for environments without Docker. Brings in vLLM 0.19.0 plus `datasets` and `matplotlib`. |
 | `compile.sh`      | Build ASTRA-Sim's analytical backend and install the Chakra trace converter. |
 | `run-qwen3-lpddr-sweep.py` | Generate and run Qwen3-32B dense/sparse/LPDDR simulator sweep configs, then write `summary.csv`. |
+| `analyze-qwen3-lpddr-sweep.py` | Analyze Qwen3 LPDDR sweep `summary.csv`, write comparison tables, a Markdown report, and optional plots. |
 
 ## Typical first-time setup
 
@@ -55,6 +56,17 @@ Outputs go under `outputs/sweep/qwen3_lpddr/` by default. Generated cluster
 configs go under `configs/cluster/generated/qwen3_lpddr/`.
 When `--jobs` is greater than 1, each simulator run writes its stdout/stderr to
 a `.log` file next to that run's request CSV to avoid interleaved terminal logs.
+
+Analyze completed sweep outputs:
+
+```bash
+python scripts/analyze-qwen3-lpddr-sweep.py
+python scripts/analyze-qwen3-lpddr-sweep.py --plots
+```
+
+Analysis outputs go under `outputs/sweep/qwen3_lpddr/analysis/` by default.
+`comparisons.csv` contains sparse-vs-dense and LPDDR-vs-sparse-CPU speedups;
+`report.md` lists the best latency/TPOT improvements and traffic sanity checks.
 
 ## Editing notes
 
