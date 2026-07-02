@@ -13,6 +13,7 @@ class Device(Enum):
     CPU = 2
     CXL = 3
     LPDDR = 4
+    UNTRACKED = 5
 
 class MemoryModel():
     def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
@@ -171,6 +172,12 @@ class MemoryModel():
         return int(bytes_count / bw_bytes_per_ns + self.lpddr_access_latency_ns)
 
     def _select_hbm_victims(self, protected, required_bytes, policy):
+        hbm_kv_blocks = max(0, (self.npu_used - self.weight) // self._kv_block_bytes())
+        protected_hbm_blocks = sum(
+            1 for key in protected
+            if self._kv_residency.get(key) == Device.NPU
+        )
+        evictable_hbm_blocks = max(0, int(hbm_kv_blocks - protected_hbm_blocks))
         candidates = [
             key for key, dev in self._kv_residency.items()
             if dev == Device.NPU and key not in protected
@@ -182,6 +189,7 @@ class MemoryModel():
             ))
         else:
             candidates.sort(key=lambda k: self._block_last_access.get(k, 0))
+        candidates = candidates[:evictable_hbm_blocks]
 
         block_bytes = self._kv_block_bytes()
         needed_blocks = int((required_bytes + block_bytes - 1) // block_bytes)
@@ -197,6 +205,8 @@ class MemoryModel():
             self.free(block_bytes * self.num_npus, Device.CPU)
         elif src == Device.CXL:
             self.free(block_bytes * self.num_npus, Device.CXL)
+        elif src == Device.UNTRACKED:
+            pass
 
         if dst == Device.NPU:
             self.allocate(block_bytes, Device.NPU)
@@ -234,14 +244,37 @@ class MemoryModel():
         request_keys = set(self._iter_request_block_keys(req))
         selected_keys = {(req.id, int(block_id)) for block_id in selected_block_ids}
 
-        for key in request_keys:
-            # Active KV blocks that predate this feature are conservatively
-            # treated as HBM-resident until a sparse policy moves them.
-            self._kv_residency.setdefault(key, Device.NPU)
+        known_keys = {key for key in request_keys if key in self._kv_residency}
+        hbm_blocks = sum(1 for key in known_keys if self._kv_residency.get(key) == Device.NPU)
+        max_hbm_blocks = max(0, (self.npu_used - self.weight) // block_bytes)
+        missing_hbm_slots = max(0, int(max_hbm_blocks - hbm_blocks))
+        for key in sorted(request_keys):
+            if key in self._kv_residency:
+                continue
+            if missing_hbm_slots > 0:
+                # Only infer HBM residency when NPU KV accounting has room for it.
+                self._kv_residency[key] = Device.NPU
+                missing_hbm_slots -= 1
+            else:
+                self._kv_residency[key] = Device.UNTRACKED
+        npu_keys = [
+            key for key in request_keys
+            if self._kv_residency.get(key) == Device.NPU
+        ]
+        if len(npu_keys) > max_hbm_blocks:
+            npu_keys.sort(
+                key=lambda k: (
+                    self._block_access_count.get(k, 0),
+                    self._block_last_access.get(k, 0),
+                ),
+                reverse=True,
+            )
+            for key in npu_keys[int(max_hbm_blocks):]:
+                self._kv_residency[key] = Device.UNTRACKED
 
         to_promote = []
         for key in selected_keys:
-            dev = self._kv_residency.get(key, Device.NPU)
+            dev = self._kv_residency.get(key, Device.UNTRACKED)
             if dev == Device.NPU:
                 metrics["hbm_hit_blocks"] += 1
                 self._touch_block(key)
@@ -265,7 +298,7 @@ class MemoryModel():
                 metrics["eviction_count"] += 1
 
         for key in to_promote:
-            src = self._kv_residency.get(key, Device.NPU)
+            src = self._kv_residency.get(key, Device.UNTRACKED)
             if src != Device.NPU:
                 self._move_block(key, src, Device.NPU)
                 metrics["lpddr_promotion_bytes"] += block_bytes
