@@ -1,6 +1,9 @@
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(self, id, model, input, output, arrival, instance_id,
+                 input_hash_ids=None, output_hash_ids=None,
+                 sparse_k=None, selected_token_ids=None, selected_block_ids=None,
+                 sparse_selection_policy=None, is_init=True):
         self.id = id
         self.model = model
         self.input = input  # Always keep original input length
@@ -40,6 +43,15 @@ class Request:
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = None
         self.sub_request_index = None
+
+        # For sparse attention / tiered KV cache experiments. The selection
+        # trace is indexed by decode step and uses token positions in the
+        # request's current context, not tokenizer vocabulary ids.
+        self.sparse_k = sparse_k
+        self.selected_token_ids = selected_token_ids
+        self.selected_block_ids = selected_block_ids
+        self.sparse_selection_policy = sparse_selection_policy
+        self.sparse_decode_step = 0
 
     # to print the request information
     def __str__(self):
@@ -98,6 +110,20 @@ class Batch:
 
         # for debugging
         self.scheduled_tokens = None
+
+        # Sparse KV tiering metrics. These stay zero/empty unless the
+        # Scheduler enables sparse attention for this batch.
+        self.sparse_decode_k_list = []
+        self.sparse_k_by_request = {}
+        self.selected_block_ids_by_request = {}
+        self.sparse_copy_time_ns = 0
+        self.lpddr_promotion_bytes = 0
+        self.hbm_to_lpddr_eviction_bytes = 0
+        self.hbm_hit_blocks = 0
+        self.lpddr_hit_blocks = 0
+        self.cpu_hit_blocks = 0
+        self.promotion_count = 0
+        self.eviction_count = 0
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():
@@ -107,4 +133,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

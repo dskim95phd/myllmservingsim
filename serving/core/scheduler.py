@@ -3,6 +3,7 @@ import pandas as pd
 from time import time
 import csv
 import os
+import random
 
 from .request import *
 from .utils import *
@@ -20,7 +21,10 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
+                 enable_sparse_attention=False, sparse_k=0,
+                 sparse_selection_policy="recent_window", kv_placement_policy="lru_promote",
+                 lpddr_mem=0, lpddr_bw=0, hbm_lpddr_bw=0, lpddr_access_latency_ns=0):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -39,14 +43,22 @@ class Scheduler:
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefix_storage = prefix_storage
         self.prioritize_prefill = prioritize_prefill
+        self.enable_sparse_attention = enable_sparse_attention
+        self.sparse_k = sparse_k
+        self.sparse_selection_policy = sparse_selection_policy
+        self.kv_placement_policy = kv_placement_policy
         # lists are sorted in arrival time manner
         self.request = []
         self.inflight = []
         self.done = []
         self.batch_ids = -1
+        self.sparse_batch_metrics = []
+        self.pending_lpddr_eviction_bytes = 0
+        self.pending_lpddr_eviction_count = 0
 
         # memory model
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
+        self.memory.configure_lpddr(lpddr_mem, lpddr_bw, hbm_lpddr_bw, lpddr_access_latency_ns)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
@@ -62,8 +74,138 @@ class Scheduler:
         load_size = 0
         for req in batch_req[:batch_len]:
             if req.evict:
+                if self.enable_sparse_attention:
+                    continue
                 load_size += self.memory.get_evict_kv(req)
         return load_size
+
+    def _spill_request_from_hbm(self, req, evicted_kv_size):
+        self.memory.free(evicted_kv_size, Device.NPU)
+        if self.enable_sparse_attention and self.memory.is_avail(evicted_kv_size, Device.LPDDR):
+            self.memory.allocate(evicted_kv_size, Device.LPDDR)
+            self.memory.mark_request_blocks(req, Device.LPDDR)
+            req.evicted_device = Device.LPDDR
+            self.pending_lpddr_eviction_bytes += evicted_kv_size
+            block_bytes = self.memory._kv_block_bytes()
+            self.pending_lpddr_eviction_count += (evicted_kv_size + block_bytes - 1) // block_bytes
+            return Device.LPDDR
+
+        self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
+        self.memory.mark_request_blocks(req, Device.CPU)
+        req.evicted_device = Device.CPU
+        return Device.CPU
+
+    def _effective_sparse_k(self, req):
+        req_k = req.sparse_k if req.sparse_k is not None else self.sparse_k
+        if not req_k:
+            return 0
+        return max(0, min(int(req_k), int(req.num_computed_tokens)))
+
+    def _trace_selection_for_step(self, req, field):
+        trace = getattr(req, field, None)
+        if trace is None:
+            return None
+        if not isinstance(trace, list):
+            return None
+        step = req.sparse_decode_step
+        if trace and all(isinstance(x, int) for x in trace):
+            return trace
+        if step < len(trace) and isinstance(trace[step], list):
+            return trace[step]
+        return None
+
+    def _select_sparse_blocks(self, req):
+        k = self._effective_sparse_k(req)
+        if k <= 0:
+            return [], 0
+
+        traced_blocks = self._trace_selection_for_step(req, "selected_block_ids")
+        if traced_blocks is not None:
+            num_blocks = (req.num_computed_tokens + self.memory.block_size - 1) // self.memory.block_size
+            blocks = sorted({
+                int(b) for b in traced_blocks
+                if 0 <= int(b) < num_blocks
+            })
+            return blocks, min(k, len(blocks) * self.memory.block_size)
+
+        traced_tokens = self._trace_selection_for_step(req, "selected_token_ids")
+        if traced_tokens is not None:
+            toks = [int(t) for t in traced_tokens if 0 <= int(t) < req.num_computed_tokens]
+        else:
+            policy = (req.sparse_selection_policy or self.sparse_selection_policy or "recent_window").lower()
+            n = req.num_computed_tokens
+            if policy == "random_global":
+                rnd = random.Random((req.id + 1) * 1_000_003 + req.sparse_decode_step)
+                toks = rnd.sample(range(n), k) if n > k else list(range(n))
+            elif policy in ("zipf_hot", "lfu_hotness"):
+                hot = max(1, min(n, k))
+                toks = list(range(hot))
+            elif policy == "hybrid":
+                recent_n = min(n, max(1, k // 2))
+                recent = list(range(n - recent_n, n))
+                hot_n = min(n, max(0, k - recent_n))
+                hot = list(range(hot_n))
+                toks = list(dict.fromkeys(hot + recent))
+                if len(toks) < k and n > len(toks):
+                    rnd = random.Random((req.id + 1) * 97 + req.sparse_decode_step)
+                    pool = [x for x in range(n) if x not in set(toks)]
+                    toks.extend(rnd.sample(pool, min(k - len(toks), len(pool))))
+            else:
+                toks = list(range(max(0, n - k), n))
+
+        toks = toks[:k]
+        blocks = sorted({tok // self.memory.block_size for tok in toks})
+        return blocks, len(toks)
+
+    def _apply_sparse_kv_tiering(self, batch):
+        if not self.enable_sparse_attention:
+            return batch
+
+        sparse_decode_k_list = []
+        batch.hbm_to_lpddr_eviction_bytes += self.pending_lpddr_eviction_bytes
+        batch.eviction_count += self.pending_lpddr_eviction_count
+        self.pending_lpddr_eviction_bytes = 0
+        self.pending_lpddr_eviction_count = 0
+        for req in batch.requests:
+            if req.is_prefill():
+                continue
+            selected_blocks, effective_k = self._select_sparse_blocks(req)
+            sparse_decode_k_list.append(effective_k)
+            batch.sparse_k_by_request[req.id] = effective_k
+            batch.selected_block_ids_by_request[req.id] = selected_blocks
+            metrics = self.memory.plan_sparse_attention(
+                req, selected_blocks, self.kv_placement_policy,
+            )
+            batch.hbm_hit_blocks += metrics["hbm_hit_blocks"]
+            batch.lpddr_hit_blocks += metrics["lpddr_hit_blocks"]
+            batch.cpu_hit_blocks += metrics["cpu_hit_blocks"]
+            batch.lpddr_promotion_bytes += metrics["lpddr_promotion_bytes"]
+            batch.hbm_to_lpddr_eviction_bytes += metrics["hbm_to_lpddr_eviction_bytes"]
+            batch.promotion_count += metrics["promotion_count"]
+            batch.eviction_count += metrics["eviction_count"]
+            batch.sparse_copy_time_ns += metrics["copy_time_ns"]
+
+        if sparse_decode_k_list or batch.hbm_to_lpddr_eviction_bytes:
+            batch.sparse_decode_k_list = sparse_decode_k_list
+            total_hits = batch.hbm_hit_blocks + batch.lpddr_hit_blocks + batch.cpu_hit_blocks
+            hbm_hit_rate = batch.hbm_hit_blocks / total_hits if total_hits else 0.0
+            self.sparse_batch_metrics.append({
+                "instance_id": self.instance_id,
+                "batch_id": batch.batch_id,
+                "batch_time": batch.batch_time,
+                "num_decode": batch.num_decode,
+                "effective_attention_k": max(sparse_decode_k_list) if sparse_decode_k_list else 0,
+                "hbm_hit_blocks": batch.hbm_hit_blocks,
+                "lpddr_hit_blocks": batch.lpddr_hit_blocks,
+                "cpu_hit_blocks": batch.cpu_hit_blocks,
+                "hbm_hit_rate": hbm_hit_rate,
+                "lpddr_to_hbm_promotion_bytes": batch.lpddr_promotion_bytes,
+                "hbm_to_lpddr_eviction_bytes": batch.hbm_to_lpddr_eviction_bytes,
+                "promotion_count": batch.promotion_count,
+                "eviction_count": batch.eviction_count,
+                "copy_time_ns": batch.sparse_copy_time_ns,
+            })
+        return batch
 
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
@@ -207,12 +349,7 @@ class Scheduler:
                 req_to_evict.evict = True
                 self.logger.info("Eviction of the request #%d", req_to_evict.id)
                 gen_req = gen_req[:-1]
-                # spill to cpu (host) memory. get_evict_kv returns per-rank
-                # bytes; cpu_used is tracked in full-cluster bytes (matches
-                # MemoryModel.apply_kv_cache_events convention), so scale by
-                # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evicted_kv_size, Device.NPU)
-                self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
+                self._spill_request_from_hbm(req_to_evict, evicted_kv_size)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -251,7 +388,17 @@ class Scheduler:
             # load_size is per-rank, cpu_used is full-cluster.
             if load_size > 0:
                 self.memory.allocate(load_size, Device.NPU)
-                self.memory.free(load_size * self.num_npus, Device.CPU)
+                evicted_device = Device.CPU
+                for req in batch_req:
+                    if req.evict:
+                        evicted_device = getattr(req, "evicted_device", Device.CPU)
+                        break
+                if evicted_device == Device.LPDDR:
+                    self.memory.free(load_size, Device.LPDDR)
+                else:
+                    self.memory.free(load_size * self.num_npus, Device.CPU)
+                for req in batch_req:
+                    self.memory.mark_request_blocks(req, Device.NPU)
             
             # ============ STEP 5: Build batch with lists ============
             total_len = 0
@@ -294,6 +441,7 @@ class Scheduler:
             # add already fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
+            self._apply_sparse_kv_tiering(batch)
             self.inflight.append(batch)
             self.logger.info(
                 "Scheduling new batch #%d to NPU[%d]",
@@ -618,6 +766,7 @@ class Scheduler:
             if self.prefix_storage is not None:
                 for req in evicted_req:
                     self.memory.storage_cache_evicted_req(req)
+                    self.memory.mark_request_blocks(req, self.prefix_storage)
 
             
             # For debugging
@@ -626,6 +775,7 @@ class Scheduler:
             batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size)
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
+            self._apply_sparse_kv_tiering(batch)
             self.inflight.append(batch)
             self.logger.info(
                 "Scheduling new batch #%d to NPU[%d]",
@@ -707,7 +857,9 @@ class Scheduler:
                     raise Exception("Chunk length exceeds max num batched tokens")
 
                 # Update num_computed_tokens
+                old_tokens = req.num_computed_tokens
                 req.num_computed_tokens += chunk_len
+                self.memory.register_computed_blocks(req, old_tokens, req.num_computed_tokens)
                 req.chunk_len = 0  # Reset for next step
                 
                 # Check if prefill is complete
@@ -731,6 +883,10 @@ class Scheduler:
                         # remove kv cache here
                         if self.enable_prefix_caching:
                             self.memory.unlock_prefix(req, Device.NPU)
+                            if self.enable_sparse_attention:
+                                self.memory.remove_request_blocks(req)
+                        elif self.enable_sparse_attention:
+                            self.memory.free_request_residency(req)
                         else:
                             kv_size = self.memory.get_evict_kv(req)
                             self.memory.free(kv_size, Device.NPU)
@@ -771,7 +927,10 @@ class Scheduler:
                     prompt_t += req.prefix_cache_hit
                 gen_t += 1
                 req.add_itl(finish)
+                old_tokens = req.num_computed_tokens
                 req.num_computed_tokens += 1
+                self.memory.register_computed_blocks(req, old_tokens, req.num_computed_tokens)
+                req.sparse_decode_step += 1
 
             # Update computed tokens for decode
             # req.num_computed_tokens += 1
@@ -785,9 +944,15 @@ class Scheduler:
                     self.memory.cache_finished_req(req, Device.NPU) # insert happens here
                     if self.prefix_storage is not None:
                         self.memory.cache_finished_req(req, Device.CPU)
+                    if self.enable_sparse_attention:
+                        self.memory.remove_request_blocks(req)
+                elif self.enable_sparse_attention:
+                    self.memory.free_request_residency(req)
                 else:
                     kv_size = self.memory.get_evict_kv(req)
                     self.memory.free(kv_size, Device.NPU)
+                if not self.enable_sparse_attention:
+                    self.memory.remove_request_blocks(req)
                 req.add_latency(finish)
                 self.done.append(req)
                 end_reqs.append(req)
@@ -839,6 +1004,7 @@ class Scheduler:
         else:
             kv_size = self.memory.get_total_kv(req)
             self.memory.allocate(kv_size, Device.NPU)
+            self.memory.mark_request_blocks(req, Device.NPU)
     
     # get first request's arrival time
     def get_first_arrival_time(self):
@@ -952,6 +1118,26 @@ class Scheduler:
                     req.tpot,
                     req.itl
                 ])
+        self.save_sparse_output(output_file, is_append=is_append)
+
+    def save_sparse_output(self, output_file, is_append=False):
+        if not self.sparse_batch_metrics:
+            return
+        root, ext = os.path.splitext(output_file)
+        sparse_output = f"{root}.sparse{ext or '.csv'}"
+        mode = 'a' if is_append else 'w'
+        fieldnames = [
+            "instance_id", "batch_id", "batch_time", "num_decode",
+            "effective_attention_k", "hbm_hit_blocks", "lpddr_hit_blocks",
+            "cpu_hit_blocks", "hbm_hit_rate",
+            "lpddr_to_hbm_promotion_bytes", "hbm_to_lpddr_eviction_bytes",
+            "promotion_count", "eviction_count", "copy_time_ns",
+        ]
+        with open(sparse_output, mode=mode, newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            if not is_append:
+                writer.writeheader()
+            writer.writerows(self.sparse_batch_metrics)
 
 
 def main():

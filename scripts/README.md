@@ -34,5 +34,8 @@ Bare metal (vLLM side only):
 * `docker-vllm.sh` ships with a placeholder `HF_TOKEN="<your_token>"`.
   Set it to a real HuggingFace token before running so gated configs
   (Llama, etc.) auto-download on first use.
-* `--gpus all` is the default; constrain via `--gpus '"device=0,1"'`
-  if you want to share the host with other workloads.
+* `VLLM_GPUS=all` is the default. Use `VLLM_GPUS=2 ./scripts/docker-vllm.sh`
+  or `VLLM_GPUS=0,1 ./scripts/docker-vllm.sh` to expose specific host GPUs.
+* `datasets` and `matplotlib` are no longer installed by default. Use
+  `VLLM_INSTALL_EXTRAS=1 ./scripts/docker-vllm.sh` if you need workload
+  generation or plotting packages inside the vLLM container.

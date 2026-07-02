@@ -129,6 +129,19 @@ def _resolve_parallelism(instance, model_config):
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
 
+def _validate_lpddr_config(lpddr_cfg, owner):
+    if not lpddr_cfg:
+        return {}
+    if "mem_size" not in lpddr_cfg:
+        raise KeyError(f"Missing required key 'mem_size' in '{owner}.lpddr_mem' configuration.")
+    if "mem_bw" not in lpddr_cfg and "bandwidth_gbps" not in lpddr_cfg:
+        raise KeyError(
+            f"Missing required key 'mem_bw' or 'bandwidth_gbps' in '{owner}.lpddr_mem' configuration."
+        )
+    lpddr_cfg.setdefault("mem_latency", lpddr_cfg.get("access_latency_ns", 0))
+    return lpddr_cfg
+
+
 def _resolve_dp_groups(all_instances):
     """Validate DP groups and compute dp_group_size and ep_total for each instance."""
     dp_groups = {}
@@ -406,6 +419,10 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             for key in required_keys:
                 if key not in instance:
                     raise KeyError(f"Missing required key '{key}' in instance configuration.")
+            if instance.get("lpddr_mem"):
+                instance["lpddr_mem"] = _validate_lpddr_config(
+                    instance["lpddr_mem"], f"instance {inst_id}"
+                )
 
             # Resolve tp_size, pp_size, ep_size from partial config
             model_config = get_config(instance["model_name"])
@@ -463,6 +480,8 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 if key not in cpu_mem:
                     raise KeyError(f"Missing required key '{key}' in 'cpu_mem' configuration.")
                 
+        if node_config.get("lpddr_mem"):
+            raise KeyError("node.lpddr_mem is not supported. Put lpddr_mem under each instance.")
         cpu_mem_size.append(cpu_mem["mem_size"])
 
         if power_modeling: # add mem_size (dram size) to power config
@@ -508,7 +527,6 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             for key in mem_required_keys:
                 if key not in npu_mem:
                     raise KeyError(f"Missing required key '{key}' in 'npu_mem' configuration.")
-            
             if not npu_mem_enabled:
                 # insert to system configuration
                 with open(system_config_path) as f:

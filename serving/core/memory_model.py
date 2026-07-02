@@ -12,6 +12,7 @@ class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
+    LPDDR = 4
 
 class MemoryModel():
     def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
@@ -25,6 +26,11 @@ class MemoryModel():
         self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE
+        self.lpddr_mem = 0
+        self.lpddr_used = 0
+        self.lpddr_bw = 0
+        self.hbm_lpddr_bw = 0
+        self.lpddr_access_latency_ns = 0
         self.block_size = block_size
         self.fp = fp // 8 # bit -> byte of floating point
         self.kv_fp = 1 if kv_cache_dtype == 'fp8' else self.fp  # KV cache bytes per element
@@ -93,6 +99,184 @@ class MemoryModel():
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
+        self._kv_residency = {}       # (request_id, block_id) -> Device
+        self._block_last_access = {}  # (request_id, block_id) -> logical tick
+        self._block_access_count = {}
+        self._residency_clock = 0
+
+    def configure_lpddr(self, lpddr_mem=0, lpddr_bw=0, hbm_lpddr_bw=0,
+                        lpddr_access_latency_ns=0):
+        self.lpddr_mem = (lpddr_mem or 0) * GB_TO_BYTE
+        self.lpddr_bw = lpddr_bw or 0
+        self.hbm_lpddr_bw = hbm_lpddr_bw or lpddr_bw or 0
+        self.lpddr_access_latency_ns = lpddr_access_latency_ns or 0
+
+    def _kv_block_bytes(self):
+        return self.get_kv(self.block_size)
+
+    def _touch_block(self, key):
+        self._residency_clock += 1
+        self._block_last_access[key] = self._residency_clock
+        self._block_access_count[key] = self._block_access_count.get(key, 0) + 1
+
+    def _iter_request_block_keys(self, req):
+        num_blocks = (req.num_computed_tokens + self.block_size - 1) // self.block_size
+        for block_id in range(num_blocks):
+            yield (req.id, block_id)
+
+    def register_computed_blocks(self, req, old_tokens, new_tokens):
+        if new_tokens <= old_tokens:
+            return
+        first_block = old_tokens // self.block_size
+        last_block = (new_tokens - 1) // self.block_size
+        for block_id in range(first_block, last_block + 1):
+            key = (req.id, block_id)
+            self._kv_residency.setdefault(key, Device.NPU)
+            self._touch_block(key)
+
+    def mark_request_blocks(self, req, device):
+        for key in self._iter_request_block_keys(req):
+            self._kv_residency[key] = device
+            self._touch_block(key)
+
+    def remove_request_blocks(self, req):
+        for key in list(self._kv_residency):
+            if key[0] == req.id:
+                self._kv_residency.pop(key, None)
+                self._block_last_access.pop(key, None)
+                self._block_access_count.pop(key, None)
+
+    def free_request_residency(self, req):
+        block_bytes = self._kv_block_bytes()
+        for key in list(self._kv_residency):
+            if key[0] != req.id:
+                continue
+            dev = self._kv_residency.get(key)
+            if dev == Device.NPU:
+                self.free(block_bytes, Device.NPU)
+            elif dev == Device.LPDDR:
+                self.free(block_bytes, Device.LPDDR)
+            elif dev == Device.CPU:
+                self.free(block_bytes * self.num_npus, Device.CPU)
+            elif dev == Device.CXL:
+                self.free(block_bytes * self.num_npus, Device.CXL)
+            self._kv_residency.pop(key, None)
+            self._block_last_access.pop(key, None)
+            self._block_access_count.pop(key, None)
+
+    def _copy_time_ns(self, bytes_count):
+        if bytes_count <= 0:
+            return 0
+        bw_bytes_per_ns = max(float(self.hbm_lpddr_bw), 1.0)
+        return int(bytes_count / bw_bytes_per_ns + self.lpddr_access_latency_ns)
+
+    def _select_hbm_victims(self, protected, required_bytes, policy):
+        candidates = [
+            key for key, dev in self._kv_residency.items()
+            if dev == Device.NPU and key not in protected
+        ]
+        if policy == "lfu_hotness":
+            candidates.sort(key=lambda k: (
+                self._block_access_count.get(k, 0),
+                self._block_last_access.get(k, 0),
+            ))
+        else:
+            candidates.sort(key=lambda k: self._block_last_access.get(k, 0))
+
+        block_bytes = self._kv_block_bytes()
+        needed_blocks = (required_bytes + block_bytes - 1) // block_bytes
+        return candidates[:needed_blocks]
+
+    def _move_block(self, key, src, dst):
+        block_bytes = self._kv_block_bytes()
+        if src == Device.NPU:
+            self.free(block_bytes, Device.NPU)
+        elif src == Device.LPDDR:
+            self.free(block_bytes, Device.LPDDR)
+        elif src == Device.CPU:
+            self.free(block_bytes * self.num_npus, Device.CPU)
+        elif src == Device.CXL:
+            self.free(block_bytes * self.num_npus, Device.CXL)
+
+        if dst == Device.NPU:
+            self.allocate(block_bytes, Device.NPU)
+        elif dst == Device.LPDDR:
+            self.allocate(block_bytes, Device.LPDDR)
+        elif dst == Device.CPU:
+            self.allocate(block_bytes * self.num_npus, Device.CPU)
+        elif dst == Device.CXL:
+            self.allocate(block_bytes * self.num_npus, Device.CXL)
+
+        self._kv_residency[key] = dst
+        self._touch_block(key)
+
+    def plan_sparse_attention(self, req, selected_block_ids, policy="lru_promote"):
+        """Rebalance sparse-attention KV blocks across HBM and LPDDR.
+
+        The existing scheduler has already allocated newly computed HBM KV.
+        Selected blocks are promoted to HBM before attention. Victim blocks are
+        evicted only when those promotions need additional HBM capacity.
+        """
+        metrics = {
+            "hbm_hit_blocks": 0,
+            "lpddr_hit_blocks": 0,
+            "cpu_hit_blocks": 0,
+            "lpddr_promotion_bytes": 0,
+            "hbm_to_lpddr_eviction_bytes": 0,
+            "promotion_count": 0,
+            "eviction_count": 0,
+            "copy_time_ns": 0,
+        }
+        if not selected_block_ids:
+            return metrics
+
+        block_bytes = self._kv_block_bytes()
+        request_keys = set(self._iter_request_block_keys(req))
+        selected_keys = {(req.id, int(block_id)) for block_id in selected_block_ids}
+
+        for key in request_keys:
+            # Active KV blocks that predate this feature are conservatively
+            # treated as HBM-resident until a sparse policy moves them.
+            self._kv_residency.setdefault(key, Device.NPU)
+
+        to_promote = []
+        for key in selected_keys:
+            dev = self._kv_residency.get(key, Device.NPU)
+            if dev == Device.NPU:
+                metrics["hbm_hit_blocks"] += 1
+                self._touch_block(key)
+            elif dev == Device.LPDDR:
+                metrics["lpddr_hit_blocks"] += 1
+                to_promote.append(key)
+            else:
+                metrics["cpu_hit_blocks"] += 1
+                to_promote.append(key)
+
+        required_bytes = len(to_promote) * block_bytes
+        if required_bytes > 0 and self.npu_mem - self.npu_used < required_bytes:
+            need = required_bytes - (self.npu_mem - self.npu_used)
+            victims = self._select_hbm_victims(selected_keys, need, policy)
+            for victim in victims:
+                if self.lpddr_mem and self.lpddr_used + block_bytes <= self.lpddr_mem:
+                    self._move_block(victim, Device.NPU, Device.LPDDR)
+                else:
+                    self._move_block(victim, Device.NPU, Device.CPU)
+                metrics["hbm_to_lpddr_eviction_bytes"] += block_bytes
+                metrics["eviction_count"] += 1
+
+        for key in to_promote:
+            src = self._kv_residency.get(key, Device.NPU)
+            if src != Device.NPU:
+                self._move_block(key, src, Device.NPU)
+                metrics["lpddr_promotion_bytes"] += block_bytes
+                metrics["promotion_count"] += 1
+
+        metrics["copy_time_ns"] = (
+            self._copy_time_ns(metrics["lpddr_promotion_bytes"]) +
+            self._copy_time_ns(metrics["hbm_to_lpddr_eviction_bytes"])
+        )
+        return metrics
+
     def get_weight(self):
         """Per-GPU model weight in bytes.
 
@@ -233,14 +417,15 @@ class MemoryModel():
         self.npu_used -= self.weight
 
     def is_free(self):
-        is_free = self.npu_used == 0 and self.cpu_used == 0
+        is_free = self.npu_used == 0 and self.cpu_used == 0 and self.lpddr_used == 0
         if not is_free:
             self.logger.error(
-                "Memory leak detected: NPU used: %.2fMB, CPU used: %.2fMB",
+                "Memory leak detected at node=%d inst=%d: NPU used: %.2fMB, CPU used: %.2fMB, LPDDR used: %.2fMB",
                 self.node_id,
                 self.instance_id,
                 self.npu_used / MB_TO_BYTE,
                 self.cpu_used / MB_TO_BYTE,
+                self.lpddr_used / MB_TO_BYTE,
             )
         return
 
@@ -277,6 +462,13 @@ class MemoryModel():
                 self.cpu_used += size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.allocate(size)
+        elif device == Device.LPDDR:
+            if self.lpddr_used + size > self.lpddr_mem:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] LPDDR: tried to load {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {(self.lpddr_mem - self.lpddr_used) / MB_TO_BYTE:.2f}MB is available."
+                )
+            self.lpddr_used += size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
@@ -312,6 +504,13 @@ class MemoryModel():
                 self.cpu_used -= size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.free(size)
+        elif device == Device.LPDDR:
+            if self.lpddr_used - size < 0:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] LPDDR: tried to free {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {self.lpddr_used / MB_TO_BYTE:.2f}MB is used."
+                )
+            self.lpddr_used -= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free KV cache in unsupported device {device}")
     
@@ -331,6 +530,8 @@ class MemoryModel():
                     return False 
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.is_avail(size)
+        elif device == Device.LPDDR:
+            return self.lpddr_mem - self.lpddr_used >= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
     
@@ -352,6 +553,9 @@ class MemoryModel():
                     return 0
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.need_size(size)
+        elif device == Device.LPDDR:
+            needed = size - (self.lpddr_mem - self.lpddr_used)
+            return needed if needed > 0 else 0
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 

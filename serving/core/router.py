@@ -49,6 +49,44 @@ class Router:
                              "Supported: RR, RAND, LOAD, CUSTOM")
         self.logger = get_logger(self.__class__)
 
+    @staticmethod
+    def _copy_sparse_fields(src, dst):
+        for key in (
+            'sparse_k',
+            'selected_token_ids',
+            'selected_block_ids',
+            'sparse_selection_policy',
+        ):
+            if key in src:
+                dst[key] = src[key]
+
+    @staticmethod
+    def _request_args(req_data, model, instance_id, include_hashes):
+        args = [
+            req_data['index'], model,
+            req_data['input_toks'], req_data['output_toks'],
+            req_data['arrival_time_ns'], instance_id,
+        ]
+        if include_hashes:
+            args.extend([
+                req_data.get('input_hash_ids', []),
+                req_data.get('output_hash_ids', []),
+            ])
+        elif any(k in req_data for k in (
+            'sparse_k', 'selected_token_ids', 'selected_block_ids',
+            'sparse_selection_policy',
+        )):
+            args.extend([None, None])
+
+        if len(args) > 6:
+            args.extend([
+                req_data.get('sparse_k'),
+                req_data.get('selected_token_ids'),
+                req_data.get('selected_block_ids'),
+                req_data.get('sparse_selection_policy'),
+            ])
+        return args
+
     # -----------------------------------------------------------------------
     # Instance selection policies
     # -----------------------------------------------------------------------
@@ -149,6 +187,7 @@ class Router:
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
             req_data['output_hash_ids'] = row.get('output_tok_ids', [])
+        self._copy_sparse_fields(row, req_data)
         self._pending_requests.append(req_data)
 
     def _load_agentic_session(self, row, enable_prefix_caching):
@@ -181,6 +220,7 @@ class Router:
         if enable_prefix_caching:
             req_data['input_hash_ids'] = first.get('input_tok_ids', [])
             req_data['output_hash_ids'] = first.get('output_tok_ids', [])
+        self._copy_sparse_fields(first, req_data)
         self._pending_requests.append(req_data)
         self._request_to_session[base_id] = (session_id, 0)
 
@@ -202,18 +242,15 @@ class Router:
             sched = self.prefill_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
-                sched.add_request([
-                    req_data['index'], sched.model,
-                    req_data['input_toks'], req_data['output_toks'],
-                    req_data['arrival_time_ns'], sched.instance_id,
-                    req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
-                ], is_init=self._is_init)
+                sched.add_request(
+                    self._request_args(req_data, sched.model, sched.instance_id, True),
+                    is_init=self._is_init,
+                )
             else:
-                sched.add_request([
-                    req_data['index'], sched.model,
-                    req_data['input_toks'], req_data['output_toks'],
-                    req_data['arrival_time_ns'], sched.instance_id,
-                ], is_init=self._is_init)
+                sched.add_request(
+                    self._request_args(req_data, sched.model, sched.instance_id, False),
+                    is_init=self._is_init,
+                )
 
             self._pending_idx += 1
             routed += 1
@@ -271,6 +308,7 @@ class Router:
             if self._enable_prefix_caching:
                 req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
                 req_data['output_hash_ids'] = next_sub.get('output_tok_ids', [])
+            self._copy_sparse_fields(next_sub, req_data)
             # Insert in sorted position after _pending_idx
             self._insert_pending_sorted(req_data)
             self._request_to_session[next_id] = (session_id, next_idx)

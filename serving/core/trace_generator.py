@@ -884,10 +884,15 @@ def _build_batch_ctx(batch, ctx):
     # AND capture the per-batch max/min for the skew correction below.
     prefill_chunk = sum(batch.prefill_q_list)
     kv_prefill = sum(batch.prefill_k_list)
-    n_decode = len(batch.decode_k_list)
-    kv_decode_mean = (sum(batch.decode_k_list) // n_decode) if n_decode > 0 else 0
-    kv_decode_max = max(batch.decode_k_list) if n_decode > 0 else 0
-    kv_decode_min = min(batch.decode_k_list) if n_decode > 0 else 0
+    decode_k_source = (
+        batch.sparse_decode_k_list
+        if getattr(batch, "sparse_decode_k_list", None)
+        else batch.decode_k_list
+    )
+    n_decode = len(decode_k_source)
+    kv_decode_mean = (sum(decode_k_source) // n_decode) if n_decode > 0 else 0
+    kv_decode_max = max(decode_k_source) if n_decode > 0 else 0
+    kv_decode_min = min(decode_k_source) if n_decode > 0 else 0
 
     # PIM offloading: NPU sees only the prefill portion.
     decode_lens = None
@@ -1530,6 +1535,15 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, evict_size)
 
+    sparse_copy_time = getattr(batch, "sparse_copy_time_ns", 0)
+    if sparse_copy_time > 0 and dic:
+        copy_row = [
+            "lpddr_kv_copy", str(int(sparse_copy_time)),
+            "LOCAL", "0", "LOCAL", "0", "LOCAL", "0", "NONE", "0", "NONE",
+        ]
+        insert_at = 1 if len(dic) > 1 else len(dic)
+        dic.insert(insert_at, copy_row)
+
     if power_model is not None:
         power_model.print_log(node_id)
 
@@ -1697,6 +1711,30 @@ def _make_sub_batch(batch):
             0, 0, evict, load,
         )
         sub.requests.extend(sub_reqs)
+        sub.sparse_decode_k_list = [
+            batch.sparse_k_by_request[req.id]
+            for req in sub_reqs
+            if req.id in getattr(batch, "sparse_k_by_request", {})
+        ]
+        sub.sparse_k_by_request = {
+            req.id: batch.sparse_k_by_request[req.id]
+            for req in sub_reqs
+            if req.id in getattr(batch, "sparse_k_by_request", {})
+        }
+        sub.selected_block_ids_by_request = {
+            req.id: batch.selected_block_ids_by_request[req.id]
+            for req in sub_reqs
+            if req.id in getattr(batch, "selected_block_ids_by_request", {})
+        }
+        if i == 0:
+            sub.sparse_copy_time_ns = getattr(batch, "sparse_copy_time_ns", 0)
+            sub.lpddr_promotion_bytes = getattr(batch, "lpddr_promotion_bytes", 0)
+            sub.hbm_to_lpddr_eviction_bytes = getattr(batch, "hbm_to_lpddr_eviction_bytes", 0)
+            sub.hbm_hit_blocks = getattr(batch, "hbm_hit_blocks", 0)
+            sub.lpddr_hit_blocks = getattr(batch, "lpddr_hit_blocks", 0)
+            sub.cpu_hit_blocks = getattr(batch, "cpu_hit_blocks", 0)
+            sub.promotion_count = getattr(batch, "promotion_count", 0)
+            sub.eviction_count = getattr(batch, "eviction_count", 0)
         sub_batches.append(sub)
 
     return sub_batches

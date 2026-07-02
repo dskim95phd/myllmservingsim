@@ -169,6 +169,10 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
+            "enable_sparse_attention": instance.get("enable_sparse_attention", False),
+            "sparse_k": instance.get("sparse_k", 0),
+            "sparse_selection_policy": instance.get("sparse_selection_policy", "recent_window"),
+            "kv_placement_policy": instance.get("kv_placement_policy", "lru_promote"),
         })
     return runtime_configs
 
@@ -426,6 +430,7 @@ def main():
         # Make scheduler for each instance
 
         inst_cfg = instance_runtime_configs[instance_id]
+        lpddr_cfg = instance.get("lpddr_mem", {})
 
         schedulers.append(Scheduler(
             instance["model_name"], instance["node_id"], instance_id,
@@ -440,6 +445,14 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            enable_sparse_attention=inst_cfg["enable_sparse_attention"],
+            sparse_k=inst_cfg["sparse_k"],
+            sparse_selection_policy=inst_cfg["sparse_selection_policy"],
+            kv_placement_policy=inst_cfg["kv_placement_policy"],
+            lpddr_mem=lpddr_cfg.get("mem_size", 0),
+            lpddr_bw=lpddr_cfg.get("mem_bw", lpddr_cfg.get("bandwidth_gbps", 0)),
+            hbm_lpddr_bw=lpddr_cfg.get("hbm_link_bw", lpddr_cfg.get("hbm_link_bandwidth_gbps", 0)),
+            lpddr_access_latency_ns=lpddr_cfg.get("mem_latency", lpddr_cfg.get("access_latency_ns", 0)),
         ))
 
     # Controller for astra-sim process communication
@@ -788,6 +801,10 @@ def main():
                     f"Each NPU Memory Usage {npu_used_mb:.2f} MB "
                     f"({npu_util:.3f} % Used)"
                 )
+                if mem.lpddr_mem:
+                    lpddr_used_mb = mem.lpddr_used / MB_TO_BYTE
+                    lpddr_util = mem.lpddr_used / mem.lpddr_mem * 100.0
+                    line += f", LPDDR {lpddr_used_mb:.2f} MB ({lpddr_util:.3f} % Used)"
                 if schedulers[inst_id].enable_prefix_caching:
                     line += schedulers[inst_id].memory.npu_prefix_cache.format_prefix_info()
                 print_markup(line)

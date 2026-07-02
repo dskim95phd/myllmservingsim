@@ -129,6 +129,7 @@ schema. Top-level structure:
   "model_name": "Qwen/Qwen3-32B",
   "hardware": "RTXPRO6000",
   "npu_mem": {"mem_size": 96, "mem_bw": 1597, "mem_latency": 0},
+  "lpddr_mem": {"mem_size": 128, "mem_bw": 1024, "mem_latency": 300, "hbm_link_bw": 2048},
   "num_npus": 2,
   "tp_size": 2,
   "pp_size": 1,
@@ -150,6 +151,10 @@ schema. Top-level structure:
 | `npu_mem.mem_size` | float | Per-GPU NPU memory in **GB** |
 | `npu_mem.mem_bw` | float | Per-GPU NPU memory bandwidth in **GB/s** |
 | `npu_mem.mem_latency` | float | Per-GPU NPU memory latency in **ns** |
+| `lpddr_mem.mem_size` | float | Optional per-NPU LPDDR tier capacity in **GB**. All NPUs in this instance are assumed to have the same LPDDR size |
+| `lpddr_mem.mem_bw` | float | Optional per-NPU LPDDR bandwidth in **GB/s** |
+| `lpddr_mem.mem_latency` | float | Optional LPDDR access latency in **ns** |
+| `lpddr_mem.hbm_link_bw` | float | Optional HBM-LPDDR copy bandwidth in **GB/s** |
 | `pd_type` | string \| null | `"prefill"`, `"decode"`, or `null` (combined) |
 
 ### Parallelism (at least one of `num_npus` / `tp_size`)

@@ -63,6 +63,7 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `model_name` | String | Yes | HuggingFace model identifier (must match `configs/model/`) |
 | `hardware` | String | Yes | Hardware name matching `profiler/perf_models/{hardware}/` |
 | `npu_mem` | Object | Yes | NPU memory config (`mem_size` in GB, `mem_bw` in GB/s, `mem_latency` in ns) |
+| `lpddr_mem` | Object | No | Per-NPU LPDDR tier for this instance. All NPUs in the instance use the same `mem_size`, `mem_bw`, `mem_latency`, and optional `hbm_link_bw` |
 | `pd_type` | String/null | Yes | `"prefill"`, `"decode"`, or `null` for combined |
 | `num_npus` | Integer | * | Total GPUs for this instance (inferred from `tp_size * pp_size` if omitted) |
 | `tp_size` | Integer | * | Tensor parallel degree (inferred from `num_npus // pp_size` if omitted) |
