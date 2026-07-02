@@ -225,6 +225,13 @@ def _run_case_item(args: argparse.Namespace, item: tuple[dict, Path, Path]) -> t
     return case, _run_case(args, config_path, output_path)
 
 
+def _case_label(case: dict) -> str:
+    return (
+        f"mode={case['mode']} hbm={case['hbm']}GB "
+        f"lpddr={case['lpddr']}GB k={case['sparse_k']}"
+    )
+
+
 def summarize(args: argparse.Namespace) -> Path:
     rows = []
     for request_csv in sorted(args.output_dir.glob("qwen3_*.csv")):
@@ -362,37 +369,54 @@ def main(argv: list[str] | None = None) -> int:
         items.append((case, config_path, output_path))
 
     failures = []
-    if args.jobs == 1 or args.dry_run:
-        for item in items:
-            case, rc = _run_case_item(args, item)
-            if rc != 0:
-                failures.append((case, rc))
-                print(f"FAILED rc={rc}: {case}", flush=True)
-                if args.stop_on_error:
-                    break
-    else:
-        print(f"Running {len(items)} case(s) with jobs={args.jobs}", flush=True)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
-            future_to_item = {
-                executor.submit(_run_case_item, args, item): item for item in items
-            }
-            for future in concurrent.futures.as_completed(future_to_item):
-                case, _config_path, output_path = future_to_item[future]
-                try:
-                    completed_case, rc = future.result()
-                except Exception as exc:  # pragma: no cover - defensive for runner failures
-                    completed_case, rc = case, 1
-                    print(f"FAILED exception={exc!r}: {case}", flush=True)
+    try:
+        if args.jobs == 1 or args.dry_run:
+            total = len(items)
+            for idx, item in enumerate(items, start=1):
+                case, rc = _run_case_item(args, item)
                 if rc != 0:
-                    failures.append((completed_case, rc))
-                    print(
-                        f"FAILED rc={rc}: {completed_case}; see {_log_path(output_path)}",
-                        flush=True,
-                    )
+                    failures.append((case, rc))
+                    print(f"[{idx}/{total}] FAILED rc={rc}: {_case_label(case)}", flush=True)
                     if args.stop_on_error:
-                        for pending in future_to_item:
-                            pending.cancel()
                         break
+                else:
+                    print(f"[{idx}/{total}] DONE: {_case_label(case)}", flush=True)
+        else:
+            print(f"Running {len(items)} case(s) with jobs={args.jobs}", flush=True)
+            done = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+                future_to_item = {
+                    executor.submit(_run_case_item, args, item): item for item in items
+                }
+                for future in concurrent.futures.as_completed(future_to_item):
+                    done += 1
+                    case, _config_path, output_path = future_to_item[future]
+                    try:
+                        completed_case, rc = future.result()
+                    except Exception as exc:  # pragma: no cover - defensive for runner failures
+                        completed_case, rc = case, 1
+                        print(f"FAILED exception={exc!r}: {case}", flush=True)
+                    if rc != 0:
+                        failures.append((completed_case, rc))
+                        print(
+                            f"[{done}/{len(items)}] FAILED rc={rc}: "
+                            f"{_case_label(completed_case)}; see {_log_path(output_path)}",
+                            flush=True,
+                        )
+                        if args.stop_on_error:
+                            for pending in future_to_item:
+                                pending.cancel()
+                            break
+                    else:
+                        print(
+                            f"[{done}/{len(items)}] DONE: {_case_label(completed_case)}",
+                            flush=True,
+                        )
+    except KeyboardInterrupt:
+        print("Interrupted; summarizing completed CSVs before exiting.", flush=True)
+        if not args.dry_run:
+            summarize(args)
+        raise
 
     if not args.dry_run:
         summarize(args)
