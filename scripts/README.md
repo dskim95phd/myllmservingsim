@@ -48,10 +48,13 @@ Useful options:
 python scripts/run-qwen3-lpddr-sweep.py --dry-run
 python scripts/run-qwen3-lpddr-sweep.py --summary-only
 python scripts/run-qwen3-lpddr-sweep.py --hbm-sizes 44,48,56 --lpddr-sizes 0,64,128 --sparse-ks 128,256
+python scripts/run-qwen3-lpddr-sweep.py --jobs 8
 ```
 
 Outputs go under `outputs/sweep/qwen3_lpddr/` by default. Generated cluster
 configs go under `configs/cluster/generated/qwen3_lpddr/`.
+When `--jobs` is greater than 1, each simulator run writes its stdout/stderr to
+a `.log` file next to that run's request CSV to avoid interleaved terminal logs.
 
 ## Editing notes
 

@@ -13,6 +13,7 @@ Run it from the repository root, inside the simulator environment.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -176,6 +177,10 @@ def _output_path(args: argparse.Namespace, case: dict) -> Path:
     )
 
 
+def _log_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".log")
+
+
 def _run_case(args: argparse.Namespace, config_path: Path, output_path: Path) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -200,7 +205,24 @@ def _run_case(args: argparse.Namespace, config_path: Path, output_path: Path) ->
     print(" ".join(cmd), flush=True)
     if args.dry_run:
         return 0
+
+    if args.jobs > 1:
+        log_path = _log_path(output_path)
+        print(f"  log: {log_path}", flush=True)
+        with log_path.open("w", encoding="utf-8") as log_file:
+            return subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT).returncode
+
     return subprocess.run(cmd).returncode
+
+
+def _run_case_item(args: argparse.Namespace, item: tuple[dict, Path, Path]) -> tuple[dict, int]:
+    case, config_path, output_path = item
+    print(
+        f"RUN mode={case['mode']} hbm={case['hbm']}GB "
+        f"lpddr={case['lpddr']}GB k={case['sparse_k']}",
+        flush=True,
+    )
+    return case, _run_case(args, config_path, output_path)
 
 
 def summarize(args: argparse.Namespace) -> Path:
@@ -305,6 +327,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sparse-selection-policy", default="hybrid")
     p.add_argument("--kv-placement-policy", default="lfu_hotness")
     p.add_argument("--log-level", default="WARNING")
+    p.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "Number of simulator runs to execute concurrently. "
+            "Use >1 on multicore CPU servers; parallel logs are written next to each CSV."
+        ),
+    )
     p.add_argument("--dry-run", action="store_true", help="Generate configs and print commands without running.")
     p.add_argument("--summary-only", action="store_true", help="Only rebuild summary.csv from existing outputs.")
     p.add_argument("--stop-on-error", action="store_true", help="Stop at the first failed simulator run.")
@@ -318,26 +349,50 @@ def main(argv: list[str] | None = None) -> int:
     args.lpddr_sizes = _parse_csv_numbers(args.lpddr_sizes, float)
     args.sparse_ks = _parse_csv_numbers(args.sparse_ks, int)
     args.modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    args.jobs = max(1, args.jobs)
 
     if args.summary_only:
         summarize(args)
         return 0
 
-    failures = []
+    items = []
     for case in _iter_cases(args):
         config_path = _write_case_config(args, case)
         output_path = _output_path(args, case)
-        print(
-            f"RUN mode={case['mode']} hbm={case['hbm']}GB "
-            f"lpddr={case['lpddr']}GB k={case['sparse_k']}",
-            flush=True,
-        )
-        rc = _run_case(args, config_path, output_path)
-        if rc != 0:
-            failures.append((case, rc))
-            print(f"FAILED rc={rc}: {case}", flush=True)
-            if args.stop_on_error:
-                break
+        items.append((case, config_path, output_path))
+
+    failures = []
+    if args.jobs == 1 or args.dry_run:
+        for item in items:
+            case, rc = _run_case_item(args, item)
+            if rc != 0:
+                failures.append((case, rc))
+                print(f"FAILED rc={rc}: {case}", flush=True)
+                if args.stop_on_error:
+                    break
+    else:
+        print(f"Running {len(items)} case(s) with jobs={args.jobs}", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            future_to_item = {
+                executor.submit(_run_case_item, args, item): item for item in items
+            }
+            for future in concurrent.futures.as_completed(future_to_item):
+                case, _config_path, output_path = future_to_item[future]
+                try:
+                    completed_case, rc = future.result()
+                except Exception as exc:  # pragma: no cover - defensive for runner failures
+                    completed_case, rc = case, 1
+                    print(f"FAILED exception={exc!r}: {case}", flush=True)
+                if rc != 0:
+                    failures.append((completed_case, rc))
+                    print(
+                        f"FAILED rc={rc}: {completed_case}; see {_log_path(output_path)}",
+                        flush=True,
+                    )
+                    if args.stop_on_error:
+                        for pending in future_to_item:
+                            pending.cancel()
+                        break
 
     if not args.dry_run:
         summarize(args)
