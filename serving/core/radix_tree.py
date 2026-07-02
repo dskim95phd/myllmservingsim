@@ -35,8 +35,24 @@ GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
 KB_TO_BYTE = 1024
 
+
+if msgspec is not None:
+    _KVCacheEventBase = msgspec.Struct
+else:
+    class _KVCacheEventBase:
+        """Small msgspec.Struct fallback for environments without msgspec."""
+
+        def __init_subclass__(cls, **kwargs):
+            # msgspec accepts class-definition options such as array_like/tag.
+            # Ignore them here while preserving the same class hierarchy.
+            super().__init_subclass__()
+
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
 class KVCacheEvent(
-    msgspec.Struct,
+    _KVCacheEventBase,
     array_like=True,  # type: ignore[call-arg]
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
